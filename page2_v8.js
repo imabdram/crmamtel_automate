@@ -1567,3 +1567,48 @@ if (activationResult?.success) {
 
 // Activation modal handling is now inside completeActivationFlow
 }
+
+
+// =========================================
+// COMBINED FUNCTION - Runs all 3 steps
+// =========================================
+async function runFullActivation() {
+  console.log("🚀 STARTING FULL ACTIVATION - All 3 steps");
+  console.log("==========================================");
+  
+  const wait = (ms) => new Promise(res => setTimeout(res, ms));
+  
+  try {
+    // Step 1: Page 1
+    console.log("📝 Step 1/3: Running Page 1...");
+    page1();
+    await wait(3000); // Wait for page 1 to complete
+    
+    // Step 2: Page 2 
+    console.log("⚡ Step 2/3: Running Page 2...");
+    await page2();
+    await wait(3000); // Wait for page 2 to complete
+    
+    // Step 3: Next (Complete)
+    console.log("⏩ Step 3/3: Running Next/Complete...");
+    await next();
+    
+    console.log("==========================================");
+    console.log("✅ FULL ACTIVATION COMPLETED SUCCESSFULLY");
+    
+    // Optional: Show success message
+    alert("✅ Activation Complete! Check console for details.");
+    
+    return true;
+    
+  } catch (error) {
+    console.error("❌ Activation failed:", error);
+    alert("❌ Activation failed. Check console for details.");
+    return false;
+  }
+}
+
+// Even simpler - just one function name to remember
+async function go() {
+  return await runFullActivation();
+}
