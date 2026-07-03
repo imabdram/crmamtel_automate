@@ -1,0 +1,1406 @@
+// =========================================
+// Amtel CRM activation helper (browser console)
+// Default mode is safe: dry run only.
+// =========================================
+
+(() => {
+  "use strict";
+
+  // Edit these values before running. Leave dryRun=true while testing.
+  const config = (window.amtelConfig = {
+    dryRun: true,
+    allowCheckout: false,
+    allowActivation: false,
+
+    customer: {
+      firstName: "AMTEL",
+      middleName: "AMTEL",
+      lastName: "AMTEL",
+      address: "QARDHO",
+      genderValue: "1",
+    },
+
+    nextOfKin: {
+      firstName: "AMTEL",
+      secondName: "AMTEL",
+      thirdName: "AMTEL",
+      phone: "252717102026",
+      alternativePhone: "252717102026",
+    },
+
+    identity: {
+      issuer: "Ministry of Commerce & Industry",
+      numberLength: 10,
+      expiryYears: 5,
+    },
+
+    iccidPrefix: "8925263790000",
+    msisdnPrefix: "25271",
+
+    location: {
+      domain: "HZvOmetzvIQeEKFSEkdz",
+      zone: "01DJSVS67JT0PDVE8KR0615C4E",
+      area: "01DK17S11C4RFZTE6RTVRAGJJW",
+      label: "Qardho_KARKAAR",
+    },
+
+    planName: "Base plan",
+
+    modalTitles: {
+      msisdn: "MSISDN List",
+      iccid: "IMSI List",
+      productCatalog: "Product Catalog",
+    },
+
+    sectionTitles: {
+      plan: ["Attach Plan", "Plans"],
+      msisdn: ["MSISDN", "MSISDN Series"],
+      iccid: ["ICCID", "IMSI"],
+    },
+
+    labels: {
+      add: ["Add", "+ Add", "Add New"],
+      save: ["Save", "Done"],
+      search: ["Search", "Find"],
+      next: ["Next"],
+      checkout: ["Checkout"],
+      verify: ["Verify"],
+      close: ["Close", "OK"],
+      activate: ["Activate", "Confirm Activation"],
+    },
+
+    selectors: {
+      homeLogo: "img.logoImg",
+      prepaid: "#isprepaid",
+      iccidRadio: "#iccid",
+      idTypeSelect: "#idtype",
+      activationSearchInput: "#number",
+      activationButton:
+        'button[data-action="activate"], button[aria-label*="Activate" i], button[title*="Activate" i]',
+    },
+
+    messages: {
+      mcashAvailable: /user\s+does(?:\s+not|n['’]t)\s+exist\s+on\s+mcash/i,
+      mcashUnavailable: /user\s+exist[s]?\s+on\s+mcash/i,
+      success: /(success|successful|activated|completed|complete|created|processed)/i,
+      failure: /(failed|error|unable|cannot|rejected|denied)/i,
+    },
+
+    timeouts: {
+      short: 2500,
+      standard: 7000,
+      long: 12000,
+    },
+
+    maxPromptAttempts: 5,
+  });
+
+  // Runtime-only state for the current browser-page session.
+  const state = (window.amtelState = {
+    iccid: null,
+    iccidSuffix: null,
+    msisdn: null,
+    msisdnSuffix: null,
+    mcashVerified: false,
+    selectedPlan: null,
+    checkoutMessage: null,
+    activationMessage: null,
+  });
+
+  const ok = (extra = {}) => ({ ok: true, ...extra });
+  const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
+
+  const log = (step, message, details) => {
+    const prefix = `[CRM] ${step}:`;
+    if (details !== undefined) console.log(prefix, message, details);
+    else console.log(prefix, message);
+  };
+
+  const logError = (step, reason) => console.error(`[CRM] ${step}: ${reason}`);
+
+  const digits = (value) => String(value ?? "").replace(/\D/g, "");
+  const norm = (value) => String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+  const cssEscape = (value) =>
+    window.CSS?.escape ? window.CSS.escape(String(value)) : String(value).replace(/["\\]/g, "\\$&");
+
+  function isVisible(element) {
+    if (!element || !element.isConnected) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return (
+      style.display !== "none" &&
+      style.visibility !== "hidden" &&
+      style.opacity !== "0" &&
+      rect.width > 0 &&
+      rect.height > 0
+    );
+  }
+
+  function isEnabled(element) {
+    return Boolean(element) && !element.disabled && element.getAttribute("aria-disabled") !== "true";
+  }
+
+  function resetState() {
+    state.iccid = null;
+    state.iccidSuffix = null;
+    state.msisdn = null;
+    state.msisdnSuffix = null;
+    state.mcashVerified = false;
+    state.selectedPlan = null;
+    state.checkoutMessage = null;
+    state.activationMessage = null;
+  }
+
+  function isPlaceholder(value) {
+    const text = String(value ?? "").trim();
+    return !text || /^(YOUR_|CUSTOMER_|NEXT_OF_KIN_)/i.test(text);
+  }
+
+  function customerDisplayName() {
+    return [
+      config.customer.firstName,
+      config.customer.middleName,
+      config.customer.lastName,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+  }
+
+  function locationDisplayName() {
+    return config.location.label || `${config.location.domain} / ${config.location.zone} / ${config.location.area}`;
+  }
+
+  function confirmationText(action) {
+    return [
+      `${action} confirmation`,
+      "",
+      `Customer: ${customerDisplayName()}`,
+      `MSISDN: ${state.msisdn || "not selected"}`,
+      `ICCID: ${state.iccid || "not selected"}`,
+      `Plan: ${state.selectedPlan || config.planName || "not selected"}`,
+      `Location: ${locationDisplayName()}`,
+      "",
+      `Proceed with ${action}?`,
+    ].join("\n");
+  }
+
+  function formatDate(date) {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function randomDigits(length) {
+    const cryptoValues = new Uint32Array(length);
+    if (window.crypto?.getRandomValues) {
+      window.crypto.getRandomValues(cryptoValues);
+      return Array.from(cryptoValues, (value) => value % 10).join("");
+    }
+
+    return Array.from({ length }, () => Math.floor(Math.random() * 10)).join("");
+  }
+
+  async function waitForValue(label, condition, timeout = config.timeouts.standard) {
+    const startedAt = Date.now();
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let observer;
+      let interval;
+
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (observer) observer.disconnect();
+        if (interval) clearInterval(interval);
+        resolve(value);
+      };
+
+      const check = () => {
+        try {
+          const value = condition();
+          if (value) return finish(value);
+          if (Date.now() - startedAt >= timeout) return finish(null);
+        } catch (error) {
+          console.warn(`[CRM] Wait condition "${label}" threw an error:`, error);
+        }
+      };
+
+      observer = new MutationObserver(check);
+      observer.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        characterData: true,
+      });
+
+      interval = setInterval(check, 100);
+      check();
+    });
+  }
+
+  async function waitForElement(label, selector, root = document, timeout = config.timeouts.standard) {
+    return waitForValue(
+      label,
+      () => {
+        const element = root.querySelector(selector);
+        return element && isVisible(element) ? element : null;
+      },
+      timeout
+    );
+  }
+
+  async function waitForOption(select, value, label) {
+    return waitForValue(
+      label,
+      () => Array.from(select.options).find((option) => option.value === value) || null,
+      config.timeouts.long
+    );
+  }
+
+  function emitFieldEvents(element, events = ["input", "change", "blur"]) {
+    for (const type of events) {
+      element.dispatchEvent(new Event(type, { bubbles: true }));
+    }
+  }
+
+  function setNativeValue(element, value) {
+    const prototype =
+      element instanceof HTMLSelectElement
+        ? HTMLSelectElement.prototype
+        : element instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (descriptor?.set) descriptor.set.call(element, value);
+    else element.value = value;
+  }
+
+  function setValue(element, value, events) {
+    if (!element) return fail("Target field was not found.");
+
+    setNativeValue(element, value);
+    emitFieldEvents(element, events);
+    if (String(element.value) !== String(value)) {
+      return fail(`Could not set field "${element.id || element.name || "unknown"}".`);
+    }
+
+    return ok();
+  }
+
+  function setChecked(element, checked) {
+    if (!element) return fail("Target checkbox/radio was not found.");
+
+    if (element.checked !== checked) element.click();
+    if (element.checked !== checked) {
+      element.checked = checked;
+      emitFieldEvents(element, ["input", "change"]);
+    }
+
+    return element.checked === checked
+      ? ok()
+      : fail(`Could not set "${element.id || element.name || "checkbox"}" to ${checked}.`);
+  }
+
+  function getField(root, { ids = [], names = [] }) {
+    for (const id of ids) {
+      const found = root.querySelector(`#${cssEscape(id)}`);
+      if (found && isVisible(found)) return found;
+    }
+
+    for (const name of names) {
+      const found = root.querySelector(`[name="${cssEscape(name)}"]`);
+      if (found && isVisible(found)) return found;
+    }
+
+    return null;
+  }
+
+  function buttonMatches(button, labels) {
+    const candidates = [
+      button.textContent,
+      button.getAttribute("aria-label"),
+      button.getAttribute("title"),
+      button.dataset.action,
+      button.dataset.testid,
+    ]
+      .filter(Boolean)
+      .map(norm);
+
+    return labels.some((label) => {
+      const target = norm(label);
+      return candidates.some((candidate) => candidate === target);
+    });
+  }
+
+  function findButtonByLabels(root, labels, { enabledOnly = true } = {}) {
+    return Array.from(root.querySelectorAll("button, [role='button']")).find(
+      (button) =>
+        isVisible(button) &&
+        (!enabledOnly || isEnabled(button)) &&
+        buttonMatches(button, labels)
+    ) || null;
+  }
+
+  function findVisibleModalByTitle(title) {
+    const rawCandidates = [
+      ...document.querySelectorAll(".modal.show, [role='dialog'][aria-modal='true'], .modal-content"),
+    ];
+
+    const candidates = Array.from(
+      new Set(
+        rawCandidates.map(
+          (element) => element.closest(".modal, [role='dialog']") || element
+        )
+      )
+    );
+
+    return (
+      candidates.find(
+        (modal) => isVisible(modal) && norm(modal.textContent).includes(norm(title))
+      ) || null
+    );
+  }
+
+  async function waitForModal(title) {
+    return waitForValue(
+      `modal "${title}"`,
+      () => findVisibleModalByTitle(title),
+      config.timeouts.standard
+    );
+  }
+
+  function findSectionRoots(titles) {
+    const titleList = Array.isArray(titles) ? titles : [titles];
+    const titleElements = Array.from(
+      document.querySelectorAll(
+        "h1, h2, h3, h4, h5, h6, [role='heading'], .card-title, .heading, legend, label"
+      )
+    ).filter(
+      (element) =>
+        isVisible(element) &&
+        titleList.some((title) => norm(element.textContent).includes(norm(title)))
+    );
+
+    return titleElements.map(
+      (element) =>
+        element.closest(
+          "section, fieldset, .card, .card-body, .panel, .accordion-item, .form-group, .row"
+        ) || element.parentElement
+    );
+  }
+
+  function findAddButtonNearSection(titles) {
+    for (const root of findSectionRoots(titles)) {
+      const button = findButtonByLabels(root, config.labels.add);
+      if (button) return button;
+    }
+
+    return null;
+  }
+
+  function findModalSaveButton(modal) {
+    return (
+      findButtonByLabels(modal, config.labels.save) ||
+      Array.from(modal.querySelectorAll("button[type='submit']")).find(
+        (button) => isVisible(button) && isEnabled(button)
+      ) ||
+      null
+    );
+  }
+
+  function findSearchControls(modal, kind) {
+    const inputIds = kind === "iccid" ? ["searchtextIMSI"] : ["searchtext"];
+    const inputNames = kind === "iccid" ? ["searchtextIMSI", "imsi"] : ["searchtext", "msisdn"];
+
+    const input =
+      getField(modal, { ids: inputIds, names: inputNames }) ||
+      Array.from(modal.querySelectorAll("input[type='search'], input[type='text']")).find(isVisible) ||
+      null;
+
+    if (!input) return fail(`Search input was not found in the ${kind} modal.`);
+
+    const localRoot = input.closest(".input-group, form, .form-group") || modal;
+    const button =
+      findButtonByLabels(localRoot, config.labels.search) ||
+      findButtonByLabels(modal, config.labels.search);
+
+    if (!button) return fail(`Search button was not found in the ${kind} modal.`);
+
+    return ok({ input, button });
+  }
+
+  function rowDigitValues(row) {
+    return Array.from(row.querySelectorAll("td, th"))
+      .map((cell) => digits(cell.textContent))
+      .filter((value) => value.length >= 7);
+  }
+
+  function localMsisdn(value) {
+    const clean = digits(value);
+    return clean.startsWith("252") ? clean.slice(3) : clean;
+  }
+
+  function findMatchingRow(modal, kind, expectedFull) {
+    const expectedIccid = digits(expectedFull);
+    const expectedMsisdn = localMsisdn(expectedFull);
+
+    return (
+      Array.from(modal.querySelectorAll("table tbody tr, table tr")).find((row) => {
+        if (!isVisible(row) || !row.querySelector('input[type="checkbox"]')) return false;
+
+        const values = rowDigitValues(row);
+        return kind === "iccid"
+          ? values.some((value) => value === expectedIccid)
+          : values.some((value) => localMsisdn(value) === expectedMsisdn);
+      }) || null
+    );
+  }
+
+  function getCheckboxForRow(row) {
+    return row?.querySelector('input[type="checkbox"]') || null;
+  }
+
+  function selectExactRow(row, kind, expectedFull) {
+    const checkbox = getCheckboxForRow(row);
+    if (!checkbox) return fail(`No selectable checkbox was found for the ${kind} row.`);
+
+    const verifiedRow =
+      kind === "iccid"
+        ? rowDigitValues(row).includes(digits(expectedFull))
+        : rowDigitValues(row).some(
+            (value) => localMsisdn(value) === localMsisdn(expectedFull)
+          );
+
+    if (!verifiedRow) {
+      return fail(`The selected ${kind} row does not exactly match the requested value.`);
+    }
+
+    const selected = setChecked(checkbox, true);
+    if (!selected.ok) return selected;
+
+    return checkbox.checked
+      ? ok()
+      : fail(`The ${kind} row checkbox did not remain selected.`);
+  }
+
+  function deselectRow(row) {
+    const checkbox = getCheckboxForRow(row);
+    if (!checkbox) return;
+    setChecked(checkbox, false);
+  }
+
+  function hasExactValueVisible(expected, { allowLocalMsisdn = false } = {}) {
+    const expectedDigits = digits(expected);
+    const acceptedValues = new Set([expectedDigits]);
+
+    if (allowLocalMsisdn) acceptedValues.add(localMsisdn(expectedDigits));
+    if (!expectedDigits) return false;
+
+    const checkedRows = Array.from(
+      document.querySelectorAll('input[type="checkbox"]:checked')
+    )
+      .map((checkbox) => checkbox.closest("tr"))
+      .filter(Boolean);
+
+    if (
+      checkedRows.some((row) =>
+        rowDigitValues(row).some((value) => acceptedValues.has(value) || acceptedValues.has(localMsisdn(value)))
+      )
+    ) {
+      return true;
+    }
+
+    const formattedTokens =
+      document.body.innerText.match(/\d[\d\s-]{6,}\d/g)?.map(digits) || [];
+
+    return formattedTokens.some(
+      (value) => acceptedValues.has(value) || (allowLocalMsisdn && acceptedValues.has(localMsisdn(value)))
+    );
+  }
+
+  function getTextMessage(modal) {
+    const body =
+      modal.querySelector(".modal-body") ||
+      modal.querySelector("[role='document']") ||
+      modal;
+
+    return body.textContent.replace(/\s+/g, " ").trim();
+  }
+
+  function isSuccessfulMessage(message) {
+    return Boolean(message) && config.messages.success.test(message) && !config.messages.failure.test(message);
+  }
+
+  function configValidation() {
+    const required = [
+      ["customer.firstName", config.customer.firstName],
+      ["customer.middleName", config.customer.middleName],
+      ["customer.lastName", config.customer.lastName],
+      ["customer.address", config.customer.address],
+      ["nextOfKin.firstName", config.nextOfKin.firstName],
+      ["nextOfKin.secondName", config.nextOfKin.secondName],
+      ["nextOfKin.thirdName", config.nextOfKin.thirdName],
+      ["nextOfKin.phone", config.nextOfKin.phone],
+      ["nextOfKin.alternativePhone", config.nextOfKin.alternativePhone],
+      ["identity.issuer", config.identity.issuer],
+      ["iccidPrefix", config.iccidPrefix],
+      ["msisdnPrefix", config.msisdnPrefix],
+      ["location.domain", config.location.domain],
+      ["location.zone", config.location.zone],
+      ["location.area", config.location.area],
+      ["planName", config.planName],
+    ];
+
+    const missing = required
+      .filter(([, value]) => isPlaceholder(value))
+      .map(([name]) => name);
+
+    const invalidPhones = [config.nextOfKin.phone, config.nextOfKin.alternativePhone].filter(
+      (value) => digits(value).length < 9
+    );
+
+    if (missing.length) {
+      return fail(`Update amtelConfig before running. Missing placeholder values: ${missing.join(", ")}.`);
+    }
+
+    if (invalidPhones.length) {
+      return fail("nextOfKin.phone and nextOfKin.alternativePhone must each contain at least 9 digits.");
+    }
+
+    if (!/^\d+$/.test(config.iccidPrefix) || !/^\d+$/.test(config.msisdnPrefix)) {
+      return fail("ICCID and MSISDN prefixes must contain digits only.");
+    }
+
+    return ok();
+  }
+
+  async function promptForSuffix(label, prefix) {
+    for (let attempt = 1; attempt <= config.maxPromptAttempts; attempt += 1) {
+      const answer = prompt(
+        `${label}\nEnter exactly 7 digits. Full value will use prefix ${prefix}.\nAttempt ${attempt}/${config.maxPromptAttempts}.`
+      );
+
+      if (answer === null) return fail(`${label} entry was cancelled.`);
+
+      const suffix = digits(answer);
+      if (suffix.length === 7) return ok({ suffix, fullValue: `${prefix}${suffix}` });
+
+      alert(`Enter exactly 7 digits. You entered ${suffix.length} digit(s).`);
+    }
+
+    return fail(`${label} entry exceeded the maximum number of attempts.`);
+  }
+
+  async function saveAndCloseModal(modal, label) {
+    const saveButton = await waitForValue(
+      `${label} save button`,
+      () => findModalSaveButton(modal),
+      config.timeouts.standard
+    );
+
+    if (!saveButton) return fail(`${label} Save button was not found or is disabled.`);
+
+    saveButton.click();
+
+    const closed = await waitForValue(
+      `${label} modal close`,
+      () => !isVisible(modal),
+      config.timeouts.standard
+    );
+
+    return closed ? ok() : fail(`${label} modal did not close after Save.`);
+  }
+
+  async function selectIccid() {
+    const step = "ICCID";
+    const addButton = findAddButtonNearSection(config.sectionTitles.iccid);
+    if (!addButton) return fail("ICCID Add button was not found near the ICCID/IMSI section.");
+
+    addButton.click();
+
+    const modal = await waitForModal(config.modalTitles.iccid);
+    if (!modal) return fail(`Modal "${config.modalTitles.iccid}" did not open.`);
+
+    const controlsResult = findSearchControls(modal, "iccid");
+    if (!controlsResult.ok) return controlsResult;
+
+    const { input, button } = controlsResult;
+
+    for (let attempt = 1; attempt <= config.maxPromptAttempts; attempt += 1) {
+      const requested = await promptForSuffix("ICCID", config.iccidPrefix);
+      if (!requested.ok) return requested;
+
+      const { suffix, fullValue } = requested;
+      const setSearch = setValue(input, fullValue, ["input", "change", "keyup"]);
+      if (!setSearch.ok) return setSearch;
+
+      button.click();
+
+      const row = await waitForValue(
+        `exact ICCID row ${fullValue}`,
+        () => findMatchingRow(modal, "iccid", fullValue),
+        config.timeouts.standard
+      );
+
+      if (!row) {
+        const retry = confirm(
+          `No exact ICCID row was found for ${fullValue}.\n\nOK: enter a different suffix.\nCancel: stop.`
+        );
+        if (retry) continue;
+        return fail(`No exact ICCID row was found for ${fullValue}.`);
+      }
+
+      const selected = selectExactRow(row, "iccid", fullValue);
+      if (!selected.ok) return selected;
+
+      state.iccid = fullValue;
+      state.iccidSuffix = suffix;
+
+      if (!state.iccid.endsWith(state.iccidSuffix)) {
+        deselectRow(row);
+        state.iccid = null;
+        state.iccidSuffix = null;
+        return fail("ICCID suffix validation failed after selection.");
+      }
+
+      const saved = await saveAndCloseModal(modal, step);
+      if (!saved.ok) return saved;
+
+      log(step, `Selected exact ICCID ${state.iccid}.`);
+      return ok({ iccid: state.iccid });
+    }
+
+    return fail("ICCID selection did not finish.");
+  }
+
+  async function verifyMcash(modal, msisdn) {
+    const step = "MCASH";
+    const verifyButton = await waitForValue(
+      "MCASH Verify button",
+      () => findButtonByLabels(modal, config.labels.verify),
+      config.timeouts.short
+    );
+
+    if (!verifyButton) return fail("MCASH Verify button was not found.");
+
+    verifyButton.click();
+
+    const result = await waitForValue(
+      `clear MCASH result for ${msisdn}`,
+      () => {
+        const text = getTextMessage(modal);
+        if (config.messages.mcashAvailable.test(text)) return { available: true, message: text };
+        if (config.messages.mcashUnavailable.test(text)) return { available: false, message: text };
+        return null;
+      },
+      config.timeouts.standard
+    );
+
+    if (!result) {
+      return fail(`MCASH result for ${msisdn} was unclear. The flow stopped.`);
+    }
+
+    if (!result.available) {
+      return fail(`MSISDN ${msisdn} already exists on MCASH. Select a different number.`, {
+        message: result.message,
+      });
+    }
+
+    state.mcashVerified = true;
+    log(step, `Verified that ${msisdn} does not exist on MCASH.`);
+    return ok({ message: result.message });
+  }
+
+  async function selectMsisdn() {
+    const step = "MSISDN";
+    const addButton = findAddButtonNearSection(config.sectionTitles.msisdn);
+    if (!addButton) return fail("MSISDN Add button was not found near the MSISDN section.");
+
+    addButton.click();
+
+    const modal = await waitForModal(config.modalTitles.msisdn);
+    if (!modal) return fail(`Modal "${config.modalTitles.msisdn}" did not open.`);
+
+    const controlsResult = findSearchControls(modal, "msisdn");
+    if (!controlsResult.ok) return controlsResult;
+
+    const { input, button } = controlsResult;
+
+    for (let attempt = 1; attempt <= config.maxPromptAttempts; attempt += 1) {
+      const requested = await promptForSuffix("MSISDN", config.msisdnPrefix);
+      if (!requested.ok) return requested;
+
+      const { suffix, fullValue } = requested;
+      const setSearch = setValue(input, fullValue, ["input", "change", "keyup"]);
+      if (!setSearch.ok) return setSearch;
+
+      button.click();
+
+      const row = await waitForValue(
+        `exact MSISDN row ${fullValue}`,
+        () => findMatchingRow(modal, "msisdn", fullValue),
+        config.timeouts.standard
+      );
+
+      if (!row) {
+        const retry = confirm(
+          `No exact MSISDN row was found for ${fullValue}.\n\nOK: enter a different suffix.\nCancel: stop.`
+        );
+        if (retry) continue;
+        return fail(`No exact MSISDN row was found for ${fullValue}.`);
+      }
+
+      const selected = selectExactRow(row, "msisdn", fullValue);
+      if (!selected.ok) return selected;
+
+      state.msisdn = fullValue;
+      state.msisdnSuffix = suffix;
+      state.mcashVerified = false;
+
+      if (!localMsisdn(state.msisdn).endsWith(state.msisdnSuffix)) {
+        deselectRow(row);
+        state.msisdn = null;
+        state.msisdnSuffix = null;
+        return fail("MSISDN suffix validation failed after selection.");
+      }
+
+      const mcash = await verifyMcash(modal, state.msisdn);
+      if (!mcash.ok) {
+        deselectRow(row);
+        state.msisdn = null;
+        state.msisdnSuffix = null;
+        state.mcashVerified = false;
+
+        alert(`${mcash.reason}\nThe selected row was deselected.`);
+        const retry = confirm("Try a different MSISDN suffix?");
+        if (retry) continue;
+        return mcash;
+      }
+
+      const saved = await saveAndCloseModal(modal, step);
+      if (!saved.ok) return saved;
+
+      log(step, `Selected exact MSISDN ${state.msisdn}.`);
+      return ok({ msisdn: state.msisdn });
+    }
+
+    return fail("MSISDN selection did not finish.");
+  }
+
+  async function attachPlan() {
+    const step = "Plan";
+    const addButton = findAddButtonNearSection(config.sectionTitles.plan);
+    if (!addButton) return fail("Plan Add button was not found near the Attach Plan section.");
+
+    addButton.click();
+
+    const modal = await waitForModal(config.modalTitles.productCatalog);
+    if (!modal) return fail(`Modal "${config.modalTitles.productCatalog}" did not open.`);
+
+    const planCard = await waitForValue(
+      `plan "${config.planName}"`,
+      () => {
+        const exactLabel = Array.from(
+          modal.querySelectorAll(".card-container, .card, [role='option'], button, [data-plan-name]")
+        ).find((element) => {
+          const value = element.dataset.planName || element.textContent;
+          return isVisible(element) && norm(value) === norm(config.planName);
+        });
+
+        if (exactLabel) return exactLabel;
+
+        const matchingText = Array.from(
+          modal.querySelectorAll(".heading, .card-title, [data-plan-name]")
+        ).find(
+          (element) =>
+            isVisible(element) && norm(element.textContent || element.dataset.planName) === norm(config.planName)
+        );
+
+        return matchingText?.closest(".card-container, .card, [role='option']") || null;
+      },
+      config.timeouts.standard
+    );
+
+    if (!planCard) return fail(`Plan "${config.planName}" was not found in Product Catalog.`);
+
+    planCard.click();
+
+    const saveButton = await waitForValue(
+      "enabled Product Catalog Save button",
+      () => findModalSaveButton(modal),
+      config.timeouts.standard
+    );
+
+    if (!saveButton) return fail("Product Catalog Save button did not become enabled after plan selection.");
+
+    state.selectedPlan = config.planName;
+    const saved = await saveAndCloseModal(modal, step);
+    if (!saved.ok) return saved;
+
+    log(step, `Attached plan "${state.selectedPlan}".`);
+    return ok({ plan: state.selectedPlan });
+  }
+
+  async function page1({ reset = true } = {}) {
+    const step = "Page 1";
+    if (reset) resetState();
+
+    const validConfig = configValidation();
+    if (!validConfig.ok) return validConfig;
+
+    log(step, "Starting customer and location form.");
+
+    const fields = {
+      firstName: getField(document, { ids: ["firstName"], names: ["firstName"] }),
+      middleName: getField(document, { ids: ["middleName"], names: ["middleName"] }),
+      lastName: getField(document, { ids: ["lastName"], names: ["lastName"] }),
+      address: getField(document, { ids: ["address"], names: ["address"] }),
+      gender: getField(document, { ids: ["gender"], names: ["gender"] }),
+    };
+
+    for (const [name, field] of Object.entries(fields)) {
+      if (!field) return fail(`Page 1 field "${name}" was not found.`);
+    }
+
+    const basicValues = [
+      [fields.firstName, config.customer.firstName],
+      [fields.middleName, config.customer.middleName],
+      [fields.lastName, config.customer.lastName],
+      [fields.address, config.customer.address],
+      [fields.gender, config.customer.genderValue],
+    ];
+
+    for (const [field, value] of basicValues) {
+      const result = setValue(field, value, field === fields.gender ? ["change", "blur"] : undefined);
+      if (!result.ok) return result;
+    }
+
+    const addIdentityButton = findButtonByLabels(document, ["Add New Identity"]);
+    if (!addIdentityButton) return fail('Button "Add New Identity" was not found.');
+
+    addIdentityButton.click();
+
+    const identityNumber = await waitForElement("identity number field", "#idnumber");
+    const issuer = await waitForElement("identity issuer field", "#issuer");
+    const issueDate = await waitForElement("identity issue date field", "#issuedate");
+    const expiryDate = await waitForElement("identity expiry date field", "#expirydate");
+
+    if (!identityNumber || !issuer || !issueDate || !expiryDate) {
+      return fail("Identity form did not fully open.");
+    }
+
+    const today = new Date();
+    const expiry = new Date(today);
+    expiry.setFullYear(today.getFullYear() + Number(config.identity.expiryYears || 5));
+
+    const identityValues = [
+      [identityNumber, randomDigits(Number(config.identity.numberLength || 10))],
+      [issuer, config.identity.issuer],
+      [issueDate, formatDate(today)],
+      [expiryDate, formatDate(expiry)],
+    ];
+
+    for (const [field, value] of identityValues) {
+      const result = setValue(
+        field,
+        value,
+        field === issuer ? ["change", "input", "blur"] : ["input", "change", "blur"]
+      );
+      if (!result.ok) return result;
+    }
+
+    const identityRoot =
+      identityNumber.closest("form, .modal, .card, .card-body, .panel") || document;
+    const identitySaveButton = await waitForValue(
+      "enabled identity Save button",
+      () => findModalSaveButton(identityRoot),
+      config.timeouts.standard
+    );
+
+    if (!identitySaveButton) return fail("Identity Save button was not found or is disabled.");
+    identitySaveButton.click();
+
+    const kinFields = {
+      firstName: await waitForElement("next of kin first name", "#nextkinfname"),
+      secondName: await waitForElement("next of kin second name", "#nextkinsname"),
+      thirdName: await waitForElement("next of kin third name", "#nextkintname"),
+      phone: await waitForElement("next of kin phone", "#nextkinmsisdn"),
+      alternativePhone: await waitForElement("alternative phone", "#alternativeMsisdn"),
+    };
+
+    for (const [name, field] of Object.entries(kinFields)) {
+      if (!field) return fail(`Next-of-kin field "${name}" was not found.`);
+    }
+
+    const kinValues = [
+      [kinFields.firstName, config.nextOfKin.firstName],
+      [kinFields.secondName, config.nextOfKin.secondName],
+      [kinFields.thirdName, config.nextOfKin.thirdName],
+      [kinFields.phone, config.nextOfKin.phone],
+      [kinFields.alternativePhone, config.nextOfKin.alternativePhone],
+    ];
+
+    for (const [field, value] of kinValues) {
+      const result = setValue(field, value);
+      if (!result.ok) return result;
+    }
+
+    const domain = await waitForElement("domain select", "#mdomain");
+    const zone = await waitForElement("zone select", "#mzone");
+    const area = await waitForElement("area select", "#marea");
+
+    if (!domain || !zone || !area) return fail("One or more location selectors were not found.");
+
+    const setDomain = setValue(domain, config.location.domain, ["change", "input", "blur"]);
+    if (!setDomain.ok) return setDomain;
+
+    const zoneOption = await waitForOption(zone, config.location.zone, "requested zone option");
+    if (!zoneOption) return fail(`Zone option "${config.location.zone}" did not load.`);
+
+    const setZone = setValue(zone, config.location.zone, ["change", "input", "blur"]);
+    if (!setZone.ok) return setZone;
+
+    const areaOption = await waitForOption(area, config.location.area, "requested area option");
+    if (!areaOption) return fail(`Area option "${config.location.area}" did not load.`);
+
+    const setArea = setValue(area, config.location.area, ["change", "input", "blur"]);
+    if (!setArea.ok) return setArea;
+
+    if (
+      domain.value !== config.location.domain ||
+      zone.value !== config.location.zone ||
+      area.value !== config.location.area
+    ) {
+      return fail("Location selection does not match the configured domain, zone, and area.");
+    }
+
+    const nextButton = findButtonByLabels(document, config.labels.next);
+    if (!nextButton) return fail('Page 1 "Next" button was not found.');
+
+    nextButton.click();
+
+    const prepaid = await waitForElement("Page 2 prepaid checkbox", config.selectors.prepaid);
+    if (!prepaid) return fail("Page 2 did not appear after Page 1 Next.");
+
+    log(step, "Completed.");
+    return ok();
+  }
+
+  async function page2() {
+    const step = "Page 2";
+    log(step, "Starting product, MSISDN, and ICCID selection.");
+
+    const prepaid = await waitForElement("prepaid checkbox", config.selectors.prepaid);
+    if (!prepaid) return fail('Checkbox "#isprepaid" was not found.');
+
+    const prepaidResult = setChecked(prepaid, true);
+    if (!prepaidResult.ok) return prepaidResult;
+
+    const iccidRadio = await waitForElement("ICCID radio", config.selectors.iccidRadio);
+    if (!iccidRadio) return fail('Radio "#iccid" was not found.');
+
+    const radioResult = setChecked(iccidRadio, true);
+    if (!radioResult.ok) return radioResult;
+
+    const planResult = await attachPlan();
+    if (!planResult.ok) return planResult;
+
+    const msisdnResult = await selectMsisdn();
+    if (!msisdnResult.ok) return msisdnResult;
+
+    const iccidResult = await selectIccid();
+    if (!iccidResult.ok) return iccidResult;
+
+    const ready = validateBeforeCheckout();
+    if (!ready.ok) return ready;
+
+    log(step, "Completed.");
+    return ok();
+  }
+
+  function validateBeforeCheckout() {
+    if (!state.iccid || !state.iccidSuffix) return fail("ICCID is missing.");
+    if (!state.msisdn || !state.msisdnSuffix) return fail("MSISDN is missing.");
+    if (!state.selectedPlan) return fail("Plan selection is missing.");
+    if (!state.mcashVerified) return fail("MCASH result is missing or unclear.");
+
+    if (!state.iccid.endsWith(state.iccidSuffix)) {
+      return fail("Selected ICCID does not match the entered ICCID suffix.");
+    }
+
+    if (!localMsisdn(state.msisdn).endsWith(state.msisdnSuffix)) {
+      return fail("Selected MSISDN does not match the entered MSISDN suffix.");
+    }
+
+    if (!hasExactValueVisible(state.iccid)) {
+      return fail("The selected ICCID is not visibly confirmed in the current UI.");
+    }
+
+    if (!hasExactValueVisible(state.msisdn, { allowLocalMsisdn: true })) {
+      return fail("The selected MSISDN is not visibly confirmed in the current UI.");
+    }
+
+    return ok();
+  }
+
+  async function clickNextAndWait(stepNumber) {
+    const before = document.body.innerText;
+    const nextButton = findButtonByLabels(document, config.labels.next);
+
+    if (!nextButton) return fail(`Next button for step ${stepNumber} was not found.`);
+
+    nextButton.click();
+
+    const changed = await waitForValue(
+      `UI progress after Next ${stepNumber}`,
+      () => document.body.innerText !== before,
+      config.timeouts.standard
+    );
+
+    return changed ? ok() : fail(`UI did not progress after Next ${stepNumber}.`);
+  }
+
+  async function readCheckoutMessage() {
+    const modal = await waitForValue(
+      "checkout result modal",
+      () => {
+        const candidates = [
+          ...document.querySelectorAll(".modal.show, [role='dialog'][aria-modal='true'], .modal-content"),
+        ];
+
+        return Array.from(
+          new Set(
+            candidates.map(
+              (element) => element.closest(".modal, [role='dialog']") || element
+            )
+          )
+        ).find((candidate) => isVisible(candidate) && getTextMessage(candidate)) || null;
+      },
+      config.timeouts.standard
+    );
+
+    return modal ? ok({ modal, message: getTextMessage(modal) }) : fail("Checkout result modal was not detected.");
+  }
+
+  async function closeModalIfPossible(modal) {
+    const closeButton = findButtonByLabels(modal, config.labels.close);
+    if (!closeButton) return ok({ closed: false });
+    closeButton.click();
+    await waitForValue("modal close", () => !isVisible(modal), config.timeouts.short);
+    return ok({ closed: !isVisible(modal) });
+  }
+
+  async function checkout() {
+    const step = "Checkout";
+    const ready = validateBeforeCheckout();
+    if (!ready.ok) return ready;
+
+    if (config.dryRun) {
+      log(step, "Dry run is enabled. Checkout was not clicked.");
+      return ok({ dryRun: true, stoppedBefore: "checkout" });
+    }
+
+    if (!config.allowCheckout) {
+      return fail("Checkout is blocked. Set amtelConfig.allowCheckout = true only after review.");
+    }
+
+    if (!confirm(confirmationText("Checkout"))) {
+      return fail("Checkout was cancelled by the user.");
+    }
+
+    const checkoutButton = await waitForValue(
+      "Checkout button",
+      () => findButtonByLabels(document, config.labels.checkout),
+      config.timeouts.standard
+    );
+
+    if (!checkoutButton) return fail("Checkout button was not found or is disabled.");
+
+    checkoutButton.click();
+
+    const checkoutResult = await readCheckoutMessage();
+    if (!checkoutResult.ok) return checkoutResult;
+
+    state.checkoutMessage = checkoutResult.message;
+    log(step, "Received checkout message.", state.checkoutMessage);
+
+    if (!isSuccessfulMessage(state.checkoutMessage)) {
+      return fail("Checkout response was not clearly successful. Activation will not run.", {
+        message: state.checkoutMessage,
+      });
+    }
+
+    await closeModalIfPossible(checkoutResult.modal);
+    return ok({ message: state.checkoutMessage });
+  }
+
+  function findActivationButtonForRow(row) {
+    const configured = Array.from(row.querySelectorAll(config.selectors.activationButton)).find(
+      (button) => isVisible(button) && isEnabled(button)
+    );
+    if (configured) return configured;
+
+    // Semantic fallback, scoped to the exact ICCID result row.
+    return (
+      Array.from(row.querySelectorAll("button, [role='button']")).find((button) => {
+        if (!isVisible(button) || !isEnabled(button)) return false;
+
+        const attrs = norm(
+          [
+            button.textContent,
+            button.getAttribute("aria-label"),
+            button.getAttribute("title"),
+            button.dataset.action,
+          ]
+            .filter(Boolean)
+            .join(" ")
+        );
+
+        const icon = norm(
+          button.querySelector(".material-icons, [data-icon]")?.textContent || ""
+        );
+
+        return attrs.includes("activate") || icon === "check_circle";
+      }) || null
+    );
+  }
+
+  async function navigateAndActivate() {
+    const step = "Activation";
+
+    const homeLogo = await waitForElement("home logo", config.selectors.homeLogo);
+    if (!homeLogo) return fail("Home logo was not found.");
+
+    homeLogo.click();
+
+    const idType = await waitForElement("activation ID type select", config.selectors.idTypeSelect);
+    if (!idType) return fail("Activation ID type selector did not appear.");
+
+    const iccidOption = Array.from(idType.options).find(
+      (option) => norm(option.textContent) === "iccid"
+    );
+    if (!iccidOption) return fail('Option "ICCID" was not found in the activation search selector.');
+
+    const idTypeResult = setValue(idType, iccidOption.value, ["change", "input", "blur"]);
+    if (!idTypeResult.ok) return idTypeResult;
+
+    const numberInput = await waitForElement(
+      "activation number input",
+      config.selectors.activationSearchInput
+    );
+    if (!numberInput) return fail("Activation number input was not found.");
+
+    const numberResult = setValue(numberInput, state.iccid, ["input", "change", "blur"]);
+    if (!numberResult.ok) return numberResult;
+
+    const searchRoot = numberInput.closest("form, .input-group, .card, .panel") || document;
+    const searchButton =
+      findButtonByLabels(searchRoot, config.labels.search) ||
+      findButtonByLabels(document, config.labels.search);
+
+    if (!searchButton) return fail("Activation Search button was not found.");
+
+    searchButton.click();
+
+    const resultRow = await waitForValue(
+      `activation row for ICCID ${state.iccid}`,
+      () =>
+        Array.from(document.querySelectorAll("table tbody tr, table tr")).find(
+          (row) => isVisible(row) && rowDigitValues(row).includes(state.iccid)
+        ) || null,
+      config.timeouts.standard
+    );
+
+    if (!resultRow) return fail(`No activation search result was found for ICCID ${state.iccid}.`);
+
+    const activateButton = findActivationButtonForRow(resultRow);
+    if (!activateButton) {
+      return fail("Activation button was not found in the exact ICCID result row.");
+    }
+
+    activateButton.click();
+
+    // Some CRM versions open a confirmation modal before the final Activate action.
+    const activationModal = await waitForValue(
+      "activation response or confirmation modal",
+      () => {
+        const candidates = [
+          ...document.querySelectorAll(".modal.show, [role='dialog'][aria-modal='true'], .modal-content"),
+        ];
+
+        return Array.from(
+          new Set(
+            candidates.map(
+              (element) => element.closest(".modal, [role='dialog']") || element
+            )
+          )
+        ).find((candidate) => isVisible(candidate) && getTextMessage(candidate)) || null;
+      },
+      config.timeouts.short
+    );
+
+    if (activationModal) {
+      const finalActivate = findButtonByLabels(activationModal, config.labels.activate);
+
+      if (finalActivate) {
+        if (!confirm(confirmationText("Final Activation"))) {
+          return fail("Final activation was cancelled by the user.");
+        }
+
+        finalActivate.click();
+      }
+    }
+
+    const finalResult = await waitForValue(
+      "clear activation result",
+      () => {
+        const candidates = [
+          ...document.querySelectorAll(".modal.show, [role='dialog'][aria-modal='true'], .modal-content"),
+        ];
+
+        const modal = Array.from(
+          new Set(
+            candidates.map(
+              (element) => element.closest(".modal, [role='dialog']") || element
+            )
+          )
+        ).find((candidate) => isVisible(candidate));
+
+        if (!modal) return null;
+
+        const message = getTextMessage(modal);
+        if (config.messages.success.test(message) || config.messages.failure.test(message)) {
+          return { modal, message };
+        }
+
+        return null;
+      },
+      config.timeouts.long
+    );
+
+    if (!finalResult) return fail("Activation result was unclear.");
+
+    state.activationMessage = finalResult.message;
+    log(step, "Received activation message.", state.activationMessage);
+
+    if (!isSuccessfulMessage(state.activationMessage)) {
+      return fail("Activation response was not clearly successful.", {
+        message: state.activationMessage,
+      });
+    }
+
+    await closeModalIfPossible(finalResult.modal);
+    return ok({ message: state.activationMessage });
+  }
+
+  async function completeActivationFlow() {
+    const step = "Activation";
+
+    if (config.dryRun) {
+      log(step, "Dry run is enabled. Activation was not clicked.");
+      return ok({ dryRun: true, stoppedBefore: "activation" });
+    }
+
+    if (!config.allowActivation) {
+      return fail("Activation is blocked. Set amtelConfig.allowActivation = true only after review.");
+    }
+
+    const ready = validateBeforeCheckout();
+    if (!ready.ok) return ready;
+
+    if (!state.checkoutMessage || !isSuccessfulMessage(state.checkoutMessage)) {
+      return fail("A clearly successful checkout message is required before activation.");
+    }
+
+    if (!confirm(confirmationText("Activation"))) {
+      return fail("Activation was cancelled by the user.");
+    }
+
+    return navigateAndActivate();
+  }
+
+  async function next() {
+    const step = "Next";
+    log(step, "Moving through remaining pages.");
+
+    const initialValidation = validateBeforeCheckout();
+    if (!initialValidation.ok) return initialValidation;
+
+    const nextOne = await clickNextAndWait(1);
+    if (!nextOne.ok) return nextOne;
+
+    const nextTwo = await clickNextAndWait(2);
+    if (!nextTwo.ok) return nextTwo;
+
+    const checkoutResult = await checkout();
+    if (!checkoutResult.ok || checkoutResult.dryRun) return checkoutResult;
+
+    const activationResult = await completeActivationFlow();
+    if (!activationResult.ok) return activationResult;
+
+    return ok({
+      checkoutMessage: state.checkoutMessage,
+      activationMessage: state.activationMessage,
+    });
+  }
+
+  async function runFullActivation() {
+    const step = "Full flow";
+    resetState();
+
+    log(
+      step,
+      `Starting. dryRun=${config.dryRun}, allowCheckout=${config.allowCheckout}, allowActivation=${config.allowActivation}`
+    );
+
+    try {
+      const first = await page1({ reset: false });
+      if (!first.ok) return first;
+
+      const second = await page2();
+      if (!second.ok) return second;
+
+      const final = await next();
+      if (!final.ok) return final;
+
+      log(step, "Finished.", {
+        iccid: state.iccid,
+        msisdn: state.msisdn,
+        dryRun: Boolean(final.dryRun),
+      });
+
+      return ok({
+        ...final,
+        state: { ...state },
+      });
+    } catch (error) {
+      const reason = error?.message || String(error);
+      logError(step, reason);
+      return fail(`Unexpected error: ${reason}`);
+    }
+  }
+
+  // Browser-console commands.
+  window.page1 = page1;
+  window.page2 = page2;
+  window.next = next;
+  window.completeActivationFlow = completeActivationFlow;
+  window.runFullActivation = runFullActivation;
+  window.go = async () => {
+    const result = await runFullActivation();
+    if (!result.ok) {
+      logError("go", result.reason);
+      alert(`CRM flow stopped: ${result.reason}`);
+    }
+    return result;
+  };
+
+  log(
+    "Ready",
+    "Use amtelConfig to set values. Dry run is ON. Run go() when configuration is ready."
+  );
+})();
